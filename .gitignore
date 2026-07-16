@@ -23,3 +23,19 @@ bin/main/application.yaml
 
 applicationinsights-agent-*.jar
 *.log
+
+# Local environment — credentials must not be committed
+.env
+
+# Terraform — local plugin cache and state (may contain secrets)
+**/.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraform.tfstate.lock.info
+# Keep .terraform.lock.hcl and environments/*.tfvars committed

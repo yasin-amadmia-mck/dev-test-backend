@@ -1,0 +1,114 @@
+name: Docker build, scan and push
+
+on:
+  workflow_call:
+    outputs:
+      sha_tag:
+        description: Full SHA image tag — used by the deploy job
+        value: ${{ jobs.docker.outputs.sha_tag }}
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+    outputs:
+      sha_tag: ${{ steps.img.outputs.sha_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Image tags:
+      #   full SHA     — exact/immutable pin to a commit
+      #   short SHA    — easier to identify/share (same commit, first 7 chars)
+      #   branch-run#  — easy to identify which branch + CI run produced the image
+      #   latest       — moving pointer to the newest master build (pushed on master only)
+      # Branch names are sanitized (e.g. feature/foo → feature-foo) so the tag is Docker-valid.
+      # Image path is lowercased — required by GHCR.
+      - name: Compute image refs
+        id: img
+        env:
+          CONTAINER_REGISTRY: ${{ secrets.CONTAINER_REGISTRY }}
+        run: |
+          registry="${CONTAINER_REGISTRY:-ghcr.io}"
+          repo=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          sha="${{ github.sha }}"
+          short_sha="${sha:0:7}"
+          branch=$(echo "${{ github.head_ref || github.ref_name }}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g')
+          run_number="${{ github.run_number }}"
+          echo "registry=${registry}"                                     >> $GITHUB_OUTPUT
+          echo "sha_tag=${registry}/${repo}:${sha}"                       >> $GITHUB_OUTPUT
+          echo "short_sha_tag=${registry}/${repo}:${short_sha}"           >> $GITHUB_OUTPUT
+          echo "branch_tag=${registry}/${repo}:${branch}-${run_number}"   >> $GITHUB_OUTPUT
+          echo "latest_tag=${registry}/${repo}:latest"                    >> $GITHUB_OUTPUT
+
+      - name: Build image
+        run: |
+          docker build \
+            -t ${{ steps.img.outputs.sha_tag }} \
+            -t ${{ steps.img.outputs.short_sha_tag }} \
+            -t ${{ steps.img.outputs.branch_tag }} \
+            .
+
+      # ---- Security scan ----
+      # Scan runs against the locally built image before any push.
+      # CRITICAL findings block the job — the image never reaches the registry.
+      - name: Scan — CRITICAL (blocking)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ steps.img.outputs.sha_tag }}
+          format: sarif
+          output: trivy-critical.sarif
+          severity: CRITICAL
+          exit-code: '1'
+          ignore-unfixed: true
+          hide-progress: true
+
+      - name: Upload CRITICAL findings to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-critical.sarif
+          category: trivy-critical
+
+      # HIGH — always() ensures this runs even when the CRITICAL scan failed.
+      # continue-on-error marks the step yellow (visible warning) rather than silently green.
+      - name: Scan — HIGH (non-blocking)
+        if: always()
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ steps.img.outputs.sha_tag }}
+          format: sarif
+          output: trivy-high.sarif
+          severity: HIGH
+          exit-code: '1'
+          ignore-unfixed: true
+          hide-progress: true
+
+      - name: Upload HIGH findings to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-high.sarif
+          category: trivy-high
+
+      # ---- Push ----
+      # Only reached if the CRITICAL scan above passed.
+      - name: Log in to container registry
+        if: github.ref == 'refs/heads/master'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ steps.img.outputs.registry }}
+          username: ${{ secrets.CONTAINER_REGISTRY_USERNAME || github.actor }}
+          password: ${{ secrets.CONTAINER_REGISTRY_PASSWORD || secrets.GITHUB_TOKEN }}
+
+      - name: Push image
+        if: github.ref == 'refs/heads/master'
+        run: |
+          docker tag ${{ steps.img.outputs.sha_tag }} ${{ steps.img.outputs.latest_tag }}
+          docker push ${{ steps.img.outputs.sha_tag }}
+          docker push ${{ steps.img.outputs.short_sha_tag }}
+          docker push ${{ steps.img.outputs.branch_tag }}
+          docker push ${{ steps.img.outputs.latest_tag }}
